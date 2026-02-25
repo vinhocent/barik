@@ -4,8 +4,9 @@ import Foundation
 
 class SpacesViewModel: ObservableObject {
     @Published var spaces: [AnySpace] = []
-    private var timer: Timer?
     private var provider: AnySpacesProvider?
+    private var observers: [NSObjectProtocol] = []
+    private var updateWorkItem: DispatchWorkItem?
 
     init() {
         let runningApps = NSWorkspace.shared.runningApplications.compactMap {
@@ -26,16 +27,83 @@ class SpacesViewModel: ObservableObject {
     }
 
     private func startMonitoring() {
-        timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) {
-            [weak self] _ in
-            self?.loadSpaces()
+        let workspace = NSWorkspace.shared
+        let notificationCenter = workspace.notificationCenter
+        let distributedCenter = DistributedNotificationCenter.default()
+
+        // Register for workspace change notifications
+        let spaceChangeObserver = notificationCenter.addObserver(
+            forName: NSWorkspace.activeSpaceDidChangeNotification,
+            object: workspace,
+            queue: .main
+        ) { [weak self] _ in
+            self?.scheduleUpdate()
         }
+        observers.append(spaceChangeObserver)
+
+        // Register for application activation (window focus changes)
+        let appActivateObserver = notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: workspace,
+            queue: .main
+        ) { [weak self] _ in
+            self?.scheduleUpdate()
+        }
+        observers.append(appActivateObserver)
+
+        // Register for application launch/termination
+        let appLaunchObserver = notificationCenter.addObserver(
+            forName: NSWorkspace.didLaunchApplicationNotification,
+            object: workspace,
+            queue: .main
+        ) { [weak self] _ in
+            self?.scheduleUpdate()
+        }
+        observers.append(appLaunchObserver)
+
+        let appTerminateObserver = notificationCenter.addObserver(
+            forName: NSWorkspace.didTerminateApplicationNotification,
+            object: workspace,
+            queue: .main
+        ) { [weak self] _ in
+            self?.scheduleUpdate()
+        }
+        observers.append(appTerminateObserver)
+
+        // Register for distributed notifications (works with AeroSpace callbacks)
+        let aerospaceUpdateObserver = distributedCenter.addObserver(
+            forName: NSNotification.Name("aerospace_workspace_change"),
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.scheduleUpdate()
+        }
+        observers.append(aerospaceUpdateObserver)
+
+        // Initial load
         loadSpaces()
     }
 
     private func stopMonitoring() {
-        timer?.invalidate()
-        timer = nil
+        for observer in observers {
+            if let name = (observer as? NSNotification).flatMap({ $0.name }) {
+                DistributedNotificationCenter.default().removeObserver(observer, name: name, object: nil)
+            } else {
+                NSWorkspace.shared.notificationCenter.removeObserver(observer)
+            }
+        }
+        observers.removeAll()
+        updateWorkItem?.cancel()
+    }
+
+    /// Debounce rapid updates to avoid excessive processing
+    private func scheduleUpdate() {
+        updateWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.loadSpaces()
+        }
+        updateWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: workItem)
     }
 
     private func loadSpaces() {
@@ -48,7 +116,13 @@ class SpacesViewModel: ObservableObject {
                 }
                 return
             }
-            let sortedSpaces = spaces.sorted { $0.id < $1.id }
+            let sortedSpaces = spaces.sorted {
+                // Try to sort numerically first, fall back to lexicographic if not numbers
+                if let num1 = Int($0.id), let num2 = Int($1.id) {
+                    return num1 < num2
+                }
+                return $0.id < $1.id
+            }
             DispatchQueue.main.async {
                 self.spaces = sortedSpaces
             }
